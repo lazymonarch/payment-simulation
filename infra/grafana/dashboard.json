@@ -1,0 +1,17 @@
+{
+  "id": null,
+  "uid": "payment-simulation",
+  "title": "Payment Simulation",
+  "tags": ["payment-simulation"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "editable": true,
+  "graphTooltip": 0,
+  "panels": []
+}
