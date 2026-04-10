@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.health import router as health_router
+from app.api.payments import router as payments_router
 from app.config import get_settings
 from app.database import close_pool, create_pool
 from app.observability.logger import get_logger, setup_logging
@@ -36,6 +37,7 @@ app = FastAPI(
 )
 
 app.include_router(health_router)
+app.include_router(payments_router)
 
 
 @app.get("/", include_in_schema=False)
