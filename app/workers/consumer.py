@@ -8,6 +8,7 @@ import structlog
 
 from app.config import get_settings
 from app.models import PaymentRequest, TransactionStatus
+from app.observability.metrics import active_workers, dlq_depth, queue_depth
 from app.services.idempotency import store_response
 from app.services.payment_processor import process_transaction
 from app.services.queue_publisher import ensure_consumer_group
@@ -117,6 +118,12 @@ async def run_worker(
                 block=2000,
             )
 
+            try:
+                queue_depth.set(await redis.xlen(settings.queue_stream_name))
+                dlq_depth.set(await redis.xlen(settings.dlq_stream_name))
+            except Exception:
+                pass
+
             if not results:
                 continue
 
@@ -157,4 +164,5 @@ async def start_workers(
         tasks.append(task)
         logger.info("worker.launched", worker_id=worker_id)
 
+    active_workers.set(len(tasks))
     return tasks

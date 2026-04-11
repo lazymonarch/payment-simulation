@@ -4,10 +4,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.health import router as health_router
+from app.api.metrics import router as metrics_router
 from app.api.payments import router as payments_router
 from app.config import get_settings
 from app.database import close_pool, create_pool
 from app.observability.logger import get_logger, setup_logging
+from app.observability.metrics import active_workers
 from app.redis_client import close_redis, create_redis
 from app.workers.consumer import start_workers
 from app.workers.dlq_consumer import run_dlq_consumer
@@ -52,6 +54,7 @@ async def lifespan(app: FastAPI):
             await asyncio.gather(app.state.dlq_task, return_exceptions=True)
         await close_pool(app.state.db_pool)
         await close_redis(app.state.redis)
+        active_workers.set(0)
         logger.info("app.stopped")
 
 
@@ -64,6 +67,7 @@ app = FastAPI(
 
 app.include_router(health_router)
 app.include_router(payments_router)
+app.include_router(metrics_router)
 
 
 @app.get("/", include_in_schema=False)

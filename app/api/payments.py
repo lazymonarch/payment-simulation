@@ -1,22 +1,28 @@
 import asyncio
+import time
+
 import structlog
 from fastapi import APIRouter, Request, HTTPException, status
 from fastapi.responses import JSONResponse
 
 from app.models import (
+    PaymentAcceptedResponse,
     PaymentRequest,
     PaymentResponse,
-    PaymentAcceptedResponse,
     TransactionStatus,
+)
+from app.observability.metrics import (
+    api_request_duration_seconds,
+    idempotency_hits_total,
+    payment_requests_total,
+    rate_limit_hits_total,
 )
 from app.services.idempotency import get_cached_response
 from app.services.queue_publisher import publish_payment
 from app.services.rate_limiter import check_rate_limit, log_rate_limit_event
-from app.config import get_settings
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/payments", tags=["payments"])
-settings = get_settings()
 
 
 @router.post(
@@ -29,6 +35,8 @@ async def submit_payment(
     payload: PaymentRequest,
     request: Request,
 ):
+    start = time.monotonic()
+
     log = logger.bind(
         txn_id=payload.txn_id,
         merchant_id=payload.merchant_id,
@@ -50,7 +58,8 @@ async def submit_payment(
             limit=limit,
         )
 
-        # Log the event to Postgres in the background — don't await it
+        rate_limit_hits_total.labels(merchant_id=payload.merchant_id).inc()
+
         asyncio.create_task(
             log_rate_limit_event(
                 merchant_id=payload.merchant_id,
@@ -58,6 +67,12 @@ async def submit_payment(
                 db_pool=request.app.state.db_pool,
             )
         )
+
+        api_request_duration_seconds.labels(
+            method="POST",
+            endpoint="/payments",
+            status_code="429",
+        ).observe(time.monotonic() - start)
 
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -79,6 +94,19 @@ async def submit_payment(
 
     if cached is not None:
         log.info("api.duplicate_request", returning_status=cached.status)
+
+        idempotency_hits_total.labels(merchant_id=payload.merchant_id).inc()
+        payment_requests_total.labels(
+            merchant_id=payload.merchant_id,
+            status="duplicate",
+        ).inc()
+
+        api_request_duration_seconds.labels(
+            method="POST",
+            endpoint="/payments",
+            status_code="200",
+        ).observe(time.monotonic() - start)
+
         return JSONResponse(
             content=cached.model_dump(mode="json"),
             status_code=status.HTTP_200_OK,
@@ -92,10 +120,26 @@ async def submit_payment(
         )
     except Exception as e:
         log.error("api.publish_failed", error=str(e))
+        api_request_duration_seconds.labels(
+            method="POST",
+            endpoint="/payments",
+            status_code="503",
+        ).observe(time.monotonic() - start)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Queue unavailable. Please retry.",
         )
+
+    payment_requests_total.labels(
+        merchant_id=payload.merchant_id,
+        status="queued",
+    ).inc()
+
+    api_request_duration_seconds.labels(
+        method="POST",
+        endpoint="/payments",
+        status_code="202",
+    ).observe(time.monotonic() - start)
 
     log.info("api.payment_queued", message_id=message_id)
 
@@ -113,6 +157,7 @@ async def submit_payment(
     description="Returns the current status. Poll after POST until status is SUCCESS or FAILED.",
 )
 async def get_payment(txn_id: str, request: Request):
+    start = time.monotonic()
     log = logger.bind(txn_id=txn_id)
 
     async with request.app.state.db_pool.acquire() as conn:
@@ -130,12 +175,23 @@ async def get_payment(txn_id: str, request: Request):
 
     if not row:
         log.warning("api.payment_not_found")
+        api_request_duration_seconds.labels(
+            method="GET",
+            endpoint="/payments/{txn_id}",
+            status_code="404",
+        ).observe(time.monotonic() - start)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Transaction {txn_id} not found",
         )
 
     log.info("api.payment_fetched", status=row["status"])
+
+    api_request_duration_seconds.labels(
+        method="GET",
+        endpoint="/payments/{txn_id}",
+        status_code="200",
+    ).observe(time.monotonic() - start)
 
     return PaymentResponse(
         txn_id=row["txn_id"],

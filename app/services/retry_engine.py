@@ -10,6 +10,7 @@ import structlog
 
 from app.config import get_settings
 from app.models import PaymentRequest
+from app.observability.metrics import dlq_messages_total, retry_attempts_total
 from app.services.payment_processor import is_retryable
 
 logger = structlog.get_logger(__name__)
@@ -53,6 +54,7 @@ async def _send_to_dlq(
         failure_reason=failure_reason,
         retry_count=retry_count,
     )
+    dlq_messages_total.labels(failure_reason=failure_reason).inc()
 
 
 async def handle_failed_transaction(
@@ -105,6 +107,7 @@ async def handle_failed_transaction(
         delay_seconds=delay,
         max_retries=settings.max_retries,
     )
+    retry_attempts_total.labels(attempt_number=str(next_attempt)).inc()
 
     await asyncio.sleep(delay)
 

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -13,6 +14,11 @@ from app.models import (
     TransactionStatus,
 )
 from app.observability.logger import get_logger
+from app.observability.metrics import (
+    payment_failures_total,
+    payment_processed_total,
+    payment_processing_duration_seconds,
+)
 
 logger = get_logger(__name__)
 
@@ -46,9 +52,24 @@ async def process_transaction(
 
     log.info("processor.started")
 
+    start_time = time.monotonic()
     await _upsert_pending(payload, db_pool)
     outcome = await _simulate_bank_call(payload, log)
-    return await _finalise_transaction(payload, outcome, db_pool, log)
+    response = await _finalise_transaction(payload, outcome, db_pool, log)
+
+    duration = time.monotonic() - start_time
+    payment_processing_duration_seconds.labels(status=response.status).observe(duration)
+    payment_processed_total.labels(
+        status=response.status,
+        payment_method=payload.payment_method,
+    ).inc()
+    if response.status == TransactionStatus.FAILED and response.failure_reason:
+        payment_failures_total.labels(
+            failure_reason=response.failure_reason,
+            retryable=str(is_retryable(response.failure_reason)),
+        ).inc()
+
+    return response
 
 
 async def _upsert_pending(
@@ -81,6 +102,10 @@ async def _simulate_bank_call(
     log,
 ) -> dict[str, Optional[str] | bool]:
     await asyncio.sleep(random.uniform(0.02, 0.12))
+
+    if payload.merchant_id == "merchant_timeout_test":
+        log.warning("processor.bank_timeout", forced=True)
+        return {"success": False, "failure_reason": FailureReason.BANK_TIMEOUT}
 
     roll = random.random()
 
