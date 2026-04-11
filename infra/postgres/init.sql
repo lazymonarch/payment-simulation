@@ -53,3 +53,6 @@ CREATE INDEX IF NOT EXISTS idx_dlq_merchant_id
 
 CREATE INDEX IF NOT EXISTS idx_dlq_resolved
     ON dlq_transactions(resolved);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_dlq_transactions_txn_id
+    ON dlq_transactions(txn_id);

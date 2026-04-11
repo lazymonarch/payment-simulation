@@ -1,8 +1,10 @@
 import structlog
 from fastapi import APIRouter, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 
-from app.models import PaymentRequest, PaymentResponse
-from app.services.payment_processor import process_transaction
+from app.models import PaymentAcceptedResponse, PaymentRequest, PaymentResponse, TransactionStatus
+from app.services.idempotency import get_cached_response
+from app.services.queue_publisher import publish_payment
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/payments", tags=["payments"])
@@ -10,10 +12,9 @@ router = APIRouter(prefix="/payments", tags=["payments"])
 
 @router.post(
     "",
-    response_model=PaymentResponse,
-    status_code=status.HTTP_201_CREATED,
+    response_model=PaymentAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Submit a payment",
-    description="Submit a payment for processing synchronously. Phase 5 will make this async.",
 )
 async def submit_payment(payload: PaymentRequest, request: Request):
     log = logger.bind(
@@ -24,26 +25,46 @@ async def submit_payment(payload: PaymentRequest, request: Request):
 
     log.info("api.payment_received")
 
+    cached = await get_cached_response(
+        txn_id=payload.txn_id,
+        redis=request.app.state.redis,
+    )
+
+    if cached is not None:
+        log.info(
+            "api.duplicate_request",
+            txn_id=payload.txn_id,
+            returning_status=cached.status,
+        )
+        return JSONResponse(
+            content=cached.model_dump(mode="json"),
+            status_code=status.HTTP_200_OK,
+        )
+
     try:
-        result = await process_transaction(
+        message_id = await publish_payment(
             payload=payload,
-            db_pool=request.app.state.db_pool,
+            redis=request.app.state.redis,
         )
-        log.info("api.payment_completed", status=result.status)
-        return result
     except Exception as exc:
-        log.error("api.payment_error", error=str(exc))
+        log.error("api.publish_failed", error=str(exc))
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Payment processing failed: {exc}",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Queue unavailable. Please retry.",
         )
+
+    log.info("api.payment_queued", message_id=message_id)
+    return PaymentAcceptedResponse(
+        txn_id=payload.txn_id,
+        status=TransactionStatus.PENDING,
+        message="Payment queued for processing",
+    )
 
 
 @router.get(
     "/{txn_id}",
     response_model=PaymentResponse,
     summary="Get payment status",
-    description="Fetch the current status of a transaction by txn_id.",
 )
 async def get_payment(txn_id: str, request: Request):
     log = logger.bind(txn_id=txn_id)
