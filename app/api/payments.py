@@ -1,22 +1,34 @@
+import asyncio
 import structlog
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Request, HTTPException, status
 from fastapi.responses import JSONResponse
 
-from app.models import PaymentAcceptedResponse, PaymentRequest, PaymentResponse, TransactionStatus
+from app.models import (
+    PaymentRequest,
+    PaymentResponse,
+    PaymentAcceptedResponse,
+    TransactionStatus,
+)
 from app.services.idempotency import get_cached_response
 from app.services.queue_publisher import publish_payment
+from app.services.rate_limiter import check_rate_limit, log_rate_limit_event
+from app.config import get_settings
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/payments", tags=["payments"])
+settings = get_settings()
 
 
 @router.post(
     "",
-    response_model=PaymentAcceptedResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Submit a payment",
+    description="Rate limited per merchant. Publishes to queue on success. Poll GET /payments/{txn_id} for result.",
 )
-async def submit_payment(payload: PaymentRequest, request: Request):
+async def submit_payment(
+    payload: PaymentRequest,
+    request: Request,
+):
     log = logger.bind(
         txn_id=payload.txn_id,
         merchant_id=payload.merchant_id,
@@ -25,35 +37,68 @@ async def submit_payment(payload: PaymentRequest, request: Request):
 
     log.info("api.payment_received")
 
+    # ── Step 1: Rate limit check ──────────────────────────────────────────────
+    allowed, current, limit = await check_rate_limit(
+        merchant_id=payload.merchant_id,
+        redis=request.app.state.redis,
+    )
+
+    if not allowed:
+        log.warning(
+            "api.rate_limited",
+            current=current,
+            limit=limit,
+        )
+
+        # Log the event to Postgres in the background — don't await it
+        asyncio.create_task(
+            log_rate_limit_event(
+                merchant_id=payload.merchant_id,
+                current_rate=float(current),
+                db_pool=request.app.state.db_pool,
+            )
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "Rate limit exceeded",
+                "merchant_id": payload.merchant_id,
+                "current": current,
+                "limit": limit,
+                "retry_after_seconds": 1,
+            },
+            headers={"Retry-After": "1"},
+        )
+
+    # ── Step 2: Idempotency check ─────────────────────────────────────────────
     cached = await get_cached_response(
         txn_id=payload.txn_id,
         redis=request.app.state.redis,
     )
 
     if cached is not None:
-        log.info(
-            "api.duplicate_request",
-            txn_id=payload.txn_id,
-            returning_status=cached.status,
-        )
+        log.info("api.duplicate_request", returning_status=cached.status)
         return JSONResponse(
             content=cached.model_dump(mode="json"),
             status_code=status.HTTP_200_OK,
         )
 
+    # ── Step 3: Publish to queue ──────────────────────────────────────────────
     try:
         message_id = await publish_payment(
             payload=payload,
             redis=request.app.state.redis,
         )
-    except Exception as exc:
-        log.error("api.publish_failed", error=str(exc))
+    except Exception as e:
+        log.error("api.publish_failed", error=str(e))
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Queue unavailable. Please retry.",
         )
 
     log.info("api.payment_queued", message_id=message_id)
+
     return PaymentAcceptedResponse(
         txn_id=payload.txn_id,
         status=TransactionStatus.PENDING,
@@ -65,6 +110,7 @@ async def submit_payment(payload: PaymentRequest, request: Request):
     "/{txn_id}",
     response_model=PaymentResponse,
     summary="Get payment status",
+    description="Returns the current status. Poll after POST until status is SUCCESS or FAILED.",
 )
 async def get_payment(txn_id: str, request: Request):
     log = logger.bind(txn_id=txn_id)
@@ -82,7 +128,7 @@ async def get_payment(txn_id: str, request: Request):
             txn_id,
         )
 
-    if row is None:
+    if not row:
         log.warning("api.payment_not_found")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
