@@ -118,34 +118,56 @@ async def run_worker(
                 block=2000,
             )
 
-            try:
-                queue_depth.set(await redis.xlen(settings.queue_stream_name))
-                dlq_depth.set(await redis.xlen(settings.dlq_stream_name))
-            except Exception:
-                pass
-
             if not results:
                 continue
 
             for _, messages in results:
-                await asyncio.gather(
-                    *[
-                        _process_message(
-                            message_id=msg_id,
-                            fields=fields,
-                            db_pool=db_pool,
-                            redis=redis,
-                            worker_id=worker_id,
-                        )
-                        for msg_id, fields in messages
-                    ]
-                )
+                tasks = [
+                    _process_message(
+                        message_id=msg_id,
+                        fields=fields,
+                        db_pool=db_pool,
+                        redis=redis,
+                        worker_id=worker_id,
+                    )
+                    for msg_id, fields in messages
+                ]
+                await asyncio.gather(*tasks)
+
+            try:
+                length = await redis.xlen(settings.queue_stream_name)
+                queue_depth.set(length)
+                dlq_length = await redis.xlen(settings.dlq_stream_name)
+                dlq_depth.set(dlq_length)
+            except Exception:
+                pass
+
         except asyncio.CancelledError:
             log.info("worker.cancelled")
             break
-        except Exception as exc:
-            log.error("worker.loop_error", error=str(exc))
-            await asyncio.sleep(1)
+        except Exception as e:
+            error_str = str(e)
+
+            if "NOGROUP" in error_str:
+                # Consumer group was lost — Redis was flushed or restarted.
+                # Recreate the group and continue without requiring an app restart.
+                log.warning(
+                    "worker.nogroup_detected",
+                    worker_id=worker_id,
+                    error=error_str,
+                )
+                try:
+                    await ensure_consumer_group(redis)
+                    log.info("worker.consumer_group_recreated", worker_id=worker_id)
+                except Exception as recreate_err:
+                    log.error(
+                        "worker.consumer_group_recreate_failed",
+                        error=str(recreate_err),
+                    )
+                    await asyncio.sleep(2)
+            else:
+                log.error("worker.loop_error", error=error_str)
+                await asyncio.sleep(1)
 
 
 async def start_workers(

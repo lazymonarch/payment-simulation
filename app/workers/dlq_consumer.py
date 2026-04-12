@@ -130,6 +130,20 @@ async def run_dlq_consumer(
         except asyncio.CancelledError:
             logger.info("dlq.consumer_cancelled")
             break
-        except Exception as exc:
-            logger.error("dlq.consumer_loop_error", error=str(exc))
-            await asyncio.sleep(2)
+        except Exception as e:
+            error_str = str(e)
+
+            if "NOGROUP" in error_str:
+                logger.warning("dlq.nogroup_detected", error=error_str)
+                try:
+                    await _ensure_dlq_group(redis)
+                    logger.info("dlq.consumer_group_recreated")
+                except Exception as recreate_err:
+                    logger.error(
+                        "dlq.consumer_group_recreate_failed",
+                        error=str(recreate_err),
+                    )
+                    await asyncio.sleep(2)
+            else:
+                logger.error("dlq.consumer_loop_error", error=error_str)
+                await asyncio.sleep(2)
